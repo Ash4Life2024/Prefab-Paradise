@@ -1,0 +1,14 @@
+
+From 0d1d7fc32e43b4dcd98f00b204e9800998ecf842 Mon Sep 17 00:00:00 2001
+From: AI TurboTonic <nova@booinc.com>
+Date: Fri, 12 Sep 2025 20:00:00 +0000
+Subject: [PATCH] Add Pinecone, Stripe, Grants.gov scrapers + workflow
+
+---
+ backend/server.js          | 25 +++++++++++++++++++++++++
+ backend/stripe.js          | 20 ++++++++++++++++++++
+ backend/pinecone.js        | 20 ++++++++++++++++++++
+ backend/grants_scraper.js  | 25 +++++++++++++++++++++++++
+ firebase/firestore.rules   |  8 ++++++++
+ .github/workflows/deploy.yml | 15 ++++++++++++++-
+ 6 files changed, 112 insertions(+), 1 deletions(-)

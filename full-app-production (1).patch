@@ -1,0 +1,226 @@
+PATCH: Prefab Paradise production additions
+
+--- FILE: render-backend/server.js ---
+import express from 'express';
+import cors from 'cors';
+import fetch from 'node-fetch';
+import rateLimit from 'express-rate-limit';
+import admin from 'firebase-admin';
+import { Configuration, OpenAIApi } from 'openai';
+import Stripe from 'stripe';
+
+// Initialize Firebase admin
+if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
+  try {
+    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY)) });
+  } catch (e) {
+    console.warn('Invalid FIREBASE_SERVICE_ACCOUNT_KEY', e.message);
+  }
+}
+
+const db = admin.firestore ? admin.firestore() : null;
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+
+const limiter = rateLimit({
+  windowMs: process.env.RATE_LIMIT_WINDOW_MS ? Number(process.env.RATE_LIMIT_WINDOW_MS) : 60000,
+  max: process.env.RATE_LIMIT_MAX ? Number(process.env.RATE_LIMIT_MAX) : 60
+});
+app.use(limiter);
+
+// OpenAI client
+const openai = process.env.OPENAI_API_KEY ? new OpenAIApi(new Configuration({ apiKey: process.env.OPENAI_API_KEY })) : null;
+// Stripe
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
+// Health
+app.get('/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+
+// Protected one-time reindex (requires ADMIN_ONE_TIME_TOKEN in env and header X-Admin-Token)
+app.post('/semantic/reindex', async (req, res) => {
+  try {
+    const provided = (req.headers['x-admin-token'] || (req.headers['authorization']||'').replace('Bearer ','')).trim();
+    if (!provided || provided !== (process.env.ADMIN_ONE_TIME_TOKEN || '')) return res.status(401).json({ error: 'unauthorized' });
+    if (!db) return res.status(500).json({ error: 'firebase not configured' });
+    if (!openai) return res.status(500).json({ error: 'openai not configured' });
+    const snap = await db.collection('financePrograms').get();
+    const items = [];
+    snap.forEach(d => items.push({ id: d.id, ...d.data() }));
+    const texts = items.map(i => (i.title + '\n' + (i.fullText || '')).slice(0, 2000));
+    const embeddings = [];
+    for (let i = 0; i < texts.length; i += 50) {
+      const batch = texts.slice(i, i + 50);
+      const resp = await openai.createEmbedding({ model: process.env.EMBED_MODEL || 'text-embedding-3-small', input: batch });
+      resp.data.data.forEach(d => embeddings.push(d.embedding));
+    }
+    // Upsert to Pinecone if configured (REST)
+    if (process.env.VECTOR_PROVIDER === 'pinecone' && process.env.PINECONE_API_KEY && process.env.PINECONE_INDEX) {
+      const url = `https://${process.env.PINECONE_INDEX}-${process.env.PINECONE_REGION || 'us-east-1'}.svc.pinecone.io/vectors/upsert`;
+      const vectors = items.map((it, idx) => ({ id: it.id, values: embeddings[idx], metadata: { title: it.title } }));
+      await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Api-Key': process.env.PINECONE_API_KEY }, body: JSON.stringify({ vectors }) });
+      return res.json({ success: true, provider: 'pinecone', count: items.length });
+    } else {
+      const batch = db.batch();
+      items.forEach((it, idx) => batch.set(db.collection('financePrograms').doc(it.id), { embedding: embeddings[idx] }, { merge: true }));
+      await batch.commit();
+      return res.json({ success: true, provider: 'firestore', count: items.length });
+    }
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Semantic search
+app.post('/semantic/search', async (req, res) => {
+  try {
+    const { query, topK = 10, state } = req.body || {};
+    if (!query) return res.status(400).json({ error: 'query required' });
+    if (!openai) return res.status(500).json({ error: 'no openai key' });
+    const r = await openai.createEmbedding({ model: process.env.EMBED_MODEL || 'text-embedding-3-small', input: query });
+    const qVec = r.data.data[0].embedding;
+    // If Pinecone configured, query it; otherwise naive Firestore scoring
+    if (process.env.VECTOR_PROVIDER === 'pinecone' && process.env.PINECONE_API_KEY && process.env.PINECONE_INDEX) {
+      const pineconeUrl = `https://${process.env.PINECONE_INDEX}-${process.env.PINECONE_REGION || 'us-east-1'}.svc.pinecone.io/query`;
+      const body = { vector: qVec, topK, includeMetadata: true };
+      if (state) body.filter = { state: { '$eq': state } };
+      const r2 = await fetch(pineconeUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Api-Key': process.env.PINECONE_API_KEY }, body: JSON.stringify(body) });
+      const jr = await r2.json();
+      const matches = jr.matches || [];
+      const out = [];
+      for (const m of matches) {
+        const doc = await db.collection('financePrograms').doc(m.id).get();
+        if (doc.exists) out.push({ id: doc.id, ...doc.data(), matchScore: m.score });
+      }
+      return res.json({ results: out });
+    } else {
+      const snap = await db.collection('financePrograms').get();
+      const out = [];
+      snap.forEach(doc => {
+        const d = doc.data();
+        let score = 0;
+        const text = (d.title + ' ' + (d.fullText || '')).toLowerCase();
+        if (text.includes(query.toLowerCase())) score += 50;
+        if (state && (d.states || []).includes(state)) score += 20;
+        if (score > 0) out.push({ id: doc.id, ...d, matchScore: score });
+      });
+      out.sort((a, b) => b.matchScore - a.matchScore);
+      return res.json({ results: out.slice(0, topK) });
+    }
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Stripe transfers (admin only)
+app.post('/payouts/create', async (req, res) => {
+  const provided = (req.headers['x-internal-token'] || (req.headers['authorization'] || '').replace('Bearer ', '')).trim();
+  if (!provided || provided !== (process.env.INTERNAL_ADMIN_TOKEN || '')) return res.status(401).json({ error: 'unauthorized' });
+  if (!stripe) return res.status(500).json({ error: 'stripe not configured' });
+  try {
+    const { amount_cents, currency = 'usd', destination } = req.body;
+    if (!destination) return res.status(400).json({ error: 'destination required' });
+    const transfer = await stripe.transfers.create({ amount: amount_cents, currency, destination });
+    await db.collection('payouts').add({ amount_cents, currency, destination, transferId: transfer.id, createdAt: admin.firestore.FieldValue.serverTimestamp() });
+    return res.json({ success: true, transferId: transfer.id });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log('Render backend listening on', PORT));
+
+
+
+--- FILE: render-backend/scrapers/grantsgov.js ---
+import fetch from 'node-fetch';
+/**
+ * Best-effort Grants.gov fetch. Grants.gov has a JSON search endpoint used in the example.
+ * If endpoint changes, update accordingly.
+ */
+export async function scrapeGrantsGov(query='housing') {
+  const q = encodeURIComponent(query);
+  const api = `https://www.grants.gov/grantsws/rest/search?keyword=${q}&startRecord=0&rows=25`;
+  try {
+    const r = await fetch(api, { headers: { 'User-Agent': 'PrefabParadise/1.0' } });
+    if (!r.ok) throw new Error('grants.gov api error '+r.status);
+    const j = await r.json();
+    const docs = j?.searchResults?.searchResultItems || j?.results || [];
+    return docs.map((item, idx) => ({
+      id: item?.opportunityNumber || item?.id || ('grantsgov-' + idx + '-' + Date.now()),
+      title: item?.opportunityTitle || item?.title || 'Grant',
+      agency: item?.fundingOrganization || item?.agency || '',
+      states: [],
+      amount_range: item?.amt || 'Varies',
+      url: item?.url || `https://www.grants.gov/`,
+      fullText: item?.description || item?.summary || ''
+    }));
+  } catch (e) {
+    console.warn('Grants.gov fetch failed', e.message);
+    return [];
+  }
+}
+
+
+
+--- FILE: backend/functions/payouts.js ---
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+const Stripe = require('stripe');
+if (!admin.apps.length) admin.initializeApp();
+const db = admin.firestore();
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
+exports.createPayout = functions.https.onCall(async (data, context) => {
+  if (!context.auth || !context.auth.token || !context.auth.token.admin) {
+    throw new functions.https.HttpsError('permission-denied', 'Admin only');
+  }
+  if(!stripe) throw new functions.https.HttpsError('failed-precondition','Stripe not configured');
+  const { amount_cents, connectedAccount } = data;
+  if(!amount_cents || !connectedAccount) throw new functions.https.HttpsError('invalid-argument','missing fields');
+  try {
+    const transfer = await stripe.transfers.create({ amount: amount_cents, currency: 'usd', destination: connectedAccount });
+    await db.collection('payouts').add({ amount_cents, connectedAccount, transferId: transfer.id, createdAt: admin.firestore.FieldValue.serverTimestamp() });
+    return { success:true, transferId: transfer.id };
+  } catch(e) {
+    console.error('stripe error', e);
+    throw new functions.https.HttpsError('internal', e.message || 'stripe error');
+  }
+});
+
+
+
+--- FILE: frontend/pages/api/payments/payout.js ---
+import admin from '../../../utils/adminClient';
+export default async function handler(req,res){
+  if(req.method !== 'POST') return res.status(405).end();
+  const token = req.headers['x-internal-token'] || req.headers.authorization?.replace('Bearer ','') || '';
+  if(token !== process.env.INTERNAL_ADMIN_TOKEN) return res.status(401).json({ error:'unauthorized' });
+  const { amount_cents, connectedAccount } = req.body;
+  if(!amount_cents || !connectedAccount) return res.status(400).json({ error:'missing fields' });
+  // Call Firebase callable function endpoint would be better; here we forward to Cloud Function URL
+  try {
+    const url = `https://us-central1-${process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID}.cloudfunctions.net/createPayout`;
+    const r = await fetch(url, { method:'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ amount_cents, connectedAccount }) });
+    const j = await r.json();
+    return res.json(j);
+  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+}
+
+
+
+--- FILE: frontend/services/pineconeClient.js ---
+import fetch from 'node-fetch';
+export async function pineconeQuery(index, apiKey, vector, topK=10, filter=null){
+  const url = `https://${index}-${process.env.PINECONE_REGION || 'us-east-1'}.svc.pinecone.io/query`;
+  const body = { vector, topK, includeMetadata:true };
+  if(filter) body.filter = filter;
+  const r = await fetch(url, { method:'POST', headers:{ 'Content-Type':'application/json', 'Api-Key': apiKey }, body: JSON.stringify(body) });
+  return r.json();
+}
+
+
