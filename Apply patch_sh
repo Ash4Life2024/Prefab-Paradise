@@ -1,0 +1,17 @@
+#!/bin/bash
+# TurboTonic patch application script
+PATCH_FILE="full-app.patch"
+
+echo "Applying TurboTonic patch..."
+git apply $PATCH_FILE
+
+echo "Adding changes to git..."
+git add .
+
+echo "Committing patch..."
+git commit -m "TurboTonic full patch applied"
+
+echo "Pushing to origin..."
+git push
+
+echo "Patch applied and pushed successfully! 💜"
